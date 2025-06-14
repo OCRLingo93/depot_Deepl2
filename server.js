@@ -2,17 +2,19 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const { exec } = require("child_process");
-const translate = require("@vitalets/google-translate-api");  // <- importer la traduction
+const util = require("util");
+const execPromise = util.promisify(exec);
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const VERIFY_TOKEN = "Mon_Token"; // même token que tu mets dans Meta
+const DEEPL_API_KEY = process.env.DEEPL_API_KEY; // 🔑 Clé API DeepL
+const VERIFY_TOKEN = "Mon_Token";
 
 app.use(express.json());
 
-// Route GET pour la validation du webhook par Meta
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -30,7 +32,14 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// Route POST pour recevoir les messages WhatsApp
+// Attendre la fin d'écriture d'un fichier
+function waitForStreamFinish(stream) {
+  return new Promise((resolve, reject) => {
+    stream.on("finish", resolve);
+    stream.on("error", reject);
+  });
+}
+
 app.post("/webhook", async (req, res) => {
   const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
@@ -39,7 +48,7 @@ app.post("/webhook", async (req, res) => {
     const mediaId = message.image.id;
 
     try {
-      // 1. Récupère l'URL de téléchargement de l'image
+      // Obtenir l'URL de l'image
       const mediaResponse = await axios.get(
         `https://graph.facebook.com/v18.0/${mediaId}`,
         {
@@ -49,7 +58,7 @@ app.post("/webhook", async (req, res) => {
 
       const mediaUrl = mediaResponse.data.url;
 
-      // 2. Télécharge l'image et la sauvegarde localement
+      // Télécharger l'image
       const imagePath = "./temp/image.jpg";
       const imageDownload = await axios.get(mediaUrl, {
         headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
@@ -58,50 +67,78 @@ app.post("/webhook", async (req, res) => {
 
       const writer = fs.createWriteStream(imagePath);
       imageDownload.data.pipe(writer);
+      await waitForStreamFinish(writer);
 
-      writer.on("finish", () => {
-        // 3. Appelle le script OCR
-        exec(`python3 ocr.py ${imagePath}`, async (error, stdout, stderr) => {
-          if (error || stderr) {
-            console.error("Erreur OCR :", error || stderr);
-            return;
+      // OCR via script Python
+      const { stdout, stderr } = await execPromise(`python3 ocr.py ${imagePath}`);
+
+      if (stderr) {
+        console.error("Erreur OCR :", stderr);
+        return res.sendStatus(500);
+      }
+
+      const texteOCR = stdout.trim();
+      console.log("Texte OCR extrait:", texteOCR);
+
+      if (!texteOCR) {
+        await axios.post(
+          `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+          {
+            messaging_product: "whatsapp",
+            to: from,
+            text: { body: "Désolé, aucun texte n'a été détecté dans l'image." },
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${ACCESS_TOKEN}`,
+              "Content-Type": "application/json",
+            },
           }
+        );
+        return res.sendStatus(200);
+      }
 
-          const texteOCR = stdout.trim();
-          console.log("Texte OCR extrait:", texteOCR);
-
-          // 4. Traduire le texte OCR en français (ou autre langue)
-          try {
-            const resTranslate = await translate(texteOCR, { to: "fr" });
-            const texteTraduit = resTranslate.text;
-            console.log("Texte traduit:", texteTraduit);
-
-            // 5. Envoie le texte traduit via WhatsApp
-            await axios.post(
-              `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-              {
-                messaging_product: "whatsapp",
-                to: from,
-                text: { body: texteTraduit },
-              },
-              {
-                headers: {
-                  Authorization: `Bearer ${ACCESS_TOKEN}`,
-                  "Content-Type": "application/json",
-                },
-              }
-            );
-            console.log("✅ Message traduit envoyé à l'utilisateur");
-          } catch (translateError) {
-            console.error("Erreur traduction :", translateError);
-          }
-        });
+      // Traduction via DeepL
+      const deeplRes = await axios.post("https://api-free.deepl.com/v2/translate", null, {
+        params: {
+          auth_key: DEEPL_API_KEY,
+          text: texteOCR,
+          target_lang: "FR",
+        },
       });
-    } catch (e) {
-      console.error("❌ Erreur générale :", e.message);
-    }
 
-    res.sendStatus(200);
+      const texteTraduit = deeplRes.data.translations[0].text;
+      console.log("Texte traduit:", texteTraduit);
+
+      // Envoyer le message traduit via WhatsApp
+      await axios.post(
+        `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+        {
+          messaging_product: "whatsapp",
+          to: from,
+          text: { body: texteTraduit },
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${ACCESS_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      console.log("✅ Message traduit envoyé à l'utilisateur");
+      res.sendStatus(200);
+    } catch (err) {
+      console.error("Erreur OCR ou traduction :", err.response?.data || err.message);
+      res.sendStatus(500);
+    } finally {
+      // Supprimer l'image temporaire
+      if (fs.existsSync("./temp/image.jpg")) {
+        fs.unlink("./temp/image.jpg", (err) => {
+          if (err) console.error("Erreur suppression image :", err.message);
+        });
+      }
+    }
   } else {
     res.sendStatus(404);
   }
