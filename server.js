@@ -2,42 +2,17 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const { exec } = require("child_process");
-const { promisify } = require("util");
-
+const translate = require("@vitalets/google-translate-api");  // <- importer la traduction
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const VERIFY_TOKEN = "Mon_Token";
-const DEEPL_API_KEY = process.env.DEEPL_API_KEY;
+const VERIFY_TOKEN = "Mon_Token"; // même token que tu mets dans Meta
 
 app.use(express.json());
 
-// 🔁 Fonction pour traduire un texte en français avec DeepL
-async function traduireTexteVersFrancais(texte) {
-  try {
-    const response = await axios.post(
-      "https://api-free.deepl.com/v2/translate",
-      new URLSearchParams({
-        auth_key: DEEPL_API_KEY,
-        text: texte,
-        target_lang: "FR",
-      }),
-      {
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-      }
-    );
-    return response.data.translations[0].text;
-  } catch (error) {
-    console.error("❌ Erreur de traduction DeepL :", error.message);
-    return texte; // Renvoie le texte original si la traduction échoue
-  }
-}
-
-// ✅ Vérification Webhook Meta
+// Route GET pour la validation du webhook par Meta
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -55,7 +30,7 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// 📥 Réception de message WhatsApp
+// Route POST pour recevoir les messages WhatsApp
 app.post("/webhook", async (req, res) => {
   const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
@@ -64,7 +39,7 @@ app.post("/webhook", async (req, res) => {
     const mediaId = message.image.id;
 
     try {
-      // 🔽 1. Récupérer l’URL de l’image
+      // 1. Récupère l'URL de téléchargement de l'image
       const mediaResponse = await axios.get(
         `https://graph.facebook.com/v18.0/${mediaId}`,
         {
@@ -74,7 +49,7 @@ app.post("/webhook", async (req, res) => {
 
       const mediaUrl = mediaResponse.data.url;
 
-      // 🔽 2. Télécharger l’image
+      // 2. Télécharge l'image et la sauvegarde localement
       const imagePath = "./temp/image.jpg";
       const imageDownload = await axios.get(mediaUrl, {
         headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
@@ -84,35 +59,43 @@ app.post("/webhook", async (req, res) => {
       const writer = fs.createWriteStream(imagePath);
       imageDownload.data.pipe(writer);
 
-      writer.on("finish", async () => {
-        try {
-          // 🔍 3. Exécuter l’OCR
-          const { stdout } = await promisify(exec)(`python ocr.py ${imagePath}`);
-          fs.unlinkSync(imagePath); // Nettoyage du fichier image
+      writer.on("finish", () => {
+        // 3. Appelle le script OCR
+        exec(`python3 ocr.py ${imagePath}`, async (error, stdout, stderr) => {
+          if (error || stderr) {
+            console.error("Erreur OCR :", error || stderr);
+            return;
+          }
 
-          const texteOCR = stdout.trim().slice(0, 4000); // Sécurité contre les textes trop longs
-          const texteTraduit = await traduireTexteVersFrancais(texteOCR);
+          const texteOCR = stdout.trim();
+          console.log("Texte OCR extrait:", texteOCR);
 
-          // 📤 4. Répondre via WhatsApp
-          await axios.post(
-            `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
-            {
-              messaging_product: "whatsapp",
-              to: from,
-              text: { body: texteTraduit },
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${ACCESS_TOKEN}`,
-                "Content-Type": "application/json",
+          // 4. Traduire le texte OCR en français (ou autre langue)
+          try {
+            const resTranslate = await translate(texteOCR, { to: "fr" });
+            const texteTraduit = resTranslate.text;
+            console.log("Texte traduit:", texteTraduit);
+
+            // 5. Envoie le texte traduit via WhatsApp
+            await axios.post(
+              `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+              {
+                messaging_product: "whatsapp",
+                to: from,
+                text: { body: texteTraduit },
               },
-            }
-          );
-
-          console.log("✅ Message OCR traduit envoyé à l'utilisateur");
-        } catch (err) {
-          console.error("❌ Erreur OCR ou traduction :", err);
-        }
+              {
+                headers: {
+                  Authorization: `Bearer ${ACCESS_TOKEN}`,
+                  "Content-Type": "application/json",
+                },
+              }
+            );
+            console.log("✅ Message traduit envoyé à l'utilisateur");
+          } catch (translateError) {
+            console.error("Erreur traduction :", translateError);
+          }
+        });
       });
     } catch (e) {
       console.error("❌ Erreur générale :", e.message);
